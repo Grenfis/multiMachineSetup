@@ -11,7 +11,9 @@
 - Mac подключён к монитору по **HDMI** (вход `17`).
 - Windows подключён к монитору по **DisplayPort** (вход `15`).
 - Клавиатура одна, ходит между машинами через USB-переключатель.
-- На каждой машине висит «сторож», который ловит момент, когда **клавиатуру у него забрали**, и переключает монитор на вход *другой* машины.
+- На каждой машине есть «сторож», который ловит момент, когда **клавиатуру у него забрали**, и переключает монитор на вход *другой* машины.
+
+Оба сторожа событийные, опроса нет: на Mac — постоянный USB-watcher Hammerspoon, на Windows — задача планировщика, которая просыпается по событию отключения USB-устройства, отрабатывает пару секунд и завершается.
 
 ### Схема срабатываний
 
@@ -157,8 +159,10 @@ ioreg -rc IOUSBHostDevice -l -w0 | grep -iA6 "ARDOR" | grep -iE "idVendor|idProd
 Создать `C:\Tools\switch-on-kbd-remove.ps1`:
 
 ```powershell
-# Переключить монитор на HDMI (Mac), когда клавиатура уходит с этой Windows-машины.
-# Раз в 2 сек проверяет, присутствует ли клавиатура, и в момент её пропажи переключает вход.
+# Переключить монитор на HDMI (Mac), когда клавиатура ARDOR уходит с этой Windows-машины.
+# Запускается задачей MonitorSwitchOnKbdRemove по событию Kernel-PnP 1010/1011 (устройство удалено).
+param([string]$DeviceId = "")
+
 $cmm     = "C:\Tools\ControlMyMonitor\ControlMyMonitor.exe"
 $monitor = "Primary"              # или конкретный ID, напр. "\\.\DISPLAY1\Monitor0"
 $vcp     = 60                     # 0x60 = Input Select
@@ -170,36 +174,128 @@ function Kbd-Present {
         Where-Object { $_.InstanceId -like "*$hwid*" })
 }
 
-$prev = Kbd-Present
-while ($true) {
-    Start-Sleep -Seconds 2
-    $now = Kbd-Present
-    if ($prev -and -not $now) {           # была -> исчезла = отключили
-        & $cmm /SetValue $monitor $vcp $hdmi
-    }
-    $prev = $now
-}
+# При ручном запуске задачи подстановка из события не выполняется и сюда приходит
+# нераскрытый литерал "$(DeviceId)" — считаем его отсутствующим значением.
+if ($DeviceId -like '$(*') { $DeviceId = "" }
+
+# Клава и мышь висят на USB-свитче: при нажатии кнопки событие приходит на свитч, а не на
+# клавиатуру. Поэтому по устройству не фильтруем — отсекаем только заведомо чужие шины
+# (аудио, WiFi-Direct, RAS), а факт ухода клавиатуры проверяем ниже.
+if ($DeviceId -and $DeviceId -notlike "USB\*") { exit 0 }
+
+Start-Sleep -Milliseconds 1500    # дать PnP удалить дочерние узлы свитча
+if (Kbd-Present) { exit 0 }
+
+& $cmm /SetValue $monitor $vcp $hdmi
 ```
 
 Под себя: `$hwid` — VID/PID вашей клавиатуры; `$hdmi` — код входа Мака.
 
-> Нагрузка минимальна: короткий опрос PnP-устройств раз в 2 сек. Для игрового ПК практически незаметно (см. раздел «Нагрузка»). Интервал можно увеличить (`-Seconds 3..5`), если хочется совсем чисто.
+> **Почему скрипт не фильтрует событие по VID/PID клавиатуры.** Это главная ловушка всей схемы. Клавиатура воткнута в USB-свитч, и при нажатии кнопки Windows пишет в журнал событие удаления **самого свитча**, а не клавиатуры — клавиатура исчезает молча, как его дочерний узел. В этом сетапе за 51 день: событий по свитчу — **698**, по клавиатуре — **8** (это редкие случаи, когда её отсоединяли напрямую). Если отфильтровать триггер по `VID_0C45`, система почти никогда не сработает.
+>
+> Поэтому триггер ловит **все** события удаления, а решение принимает скрипт — по факту отсутствия клавиатуры. Отсюда же:
+> - фильтр по подстроке в самом триггере невозможен в принципе: XPath журнала Windows **не поддерживает `contains()`**, только точное сравнение;
+> - точный фильтр по `DeviceInstanceId` тоже ненадёжен — путь меняется при перетыкании устройства в другой USB-порт;
+> - пауза 1.5 с нужна, потому что дочерние узлы свитча удаляются из PnP не мгновенно.
 
-### 4.6. Автозапуск при входе (Планировщик заданий)
+### 4.6. Запуск по событию отключения устройства (Планировщик заданий)
+
+Событие берём из журнала **`Microsoft-Windows-Kernel-PnP/Device Management`**, код **1010** («устройство было неожиданно удалено»; заодно ловим 1011 — то же самое по смыслу). Этот журнал включён в Windows 11 по умолчанию.
+
+В обоих вариантах ниже задача должна быть с галками **«Выполнять с наивысшими правами»** и **«Выполнять только для вошедших пользователей»**. Второе обязательно: DDC/CI требует доступа к интерактивному рабочему столу, из сессии 0 под `SYSTEM` ControlMyMonitor монитор не увидит.
+
+#### Вариант А — импорт XML (рекомендуется)
+
+Передаёт в скрипт ID удалённого устройства (`ValueQueries`), за счёт чего заведомо чужие события (аудио, WiFi-Direct, RAS) отсекаются мгновенно, без обращения к PnP. Через GUI так настроить нельзя.
+
+Сохранить в `C:\Tools\MonitorSwitchOnKbdRemove.xml`, заменив `{КОМПЬЮТЕР}\{username}` на своего пользователя (`whoami` покажет):
+
+```xml
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>{КОМПЬЮТЕР}\{username}</Author>
+    <Description>Переключает вход монитора на HDMI (Mac), когда клавиатура уходит с этой машины (нажата кнопка USB-свитча). Триггер: Kernel-PnP 1010/1011.</Description>
+    <URI>\MonitorSwitchOnKbdRemove</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{КОМПЬЮТЕР}\{username}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <EventTrigger>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-Kernel-PnP/Device Management"&gt;&lt;Select Path="Microsoft-Windows-Kernel-PnP/Device Management"&gt;*[System[(EventID=1010 or EventID=1011)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+      <ValueQueries>
+        <Value name="DeviceId">Event/EventData/Data[@Name="DeviceInstanceId"]</Value>
+      </ValueQueries>
+    </EventTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Tools\switch-on-kbd-remove.ps1" -DeviceId "$(DeviceId)"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+```
+
+Зарегистрировать в PowerShell **от администратора**:
+
+```powershell
+Register-ScheduledTask -TaskName 'MonitorSwitchOnKbdRemove' `
+  -Xml (Get-Content 'C:\Tools\MonitorSwitchOnKbdRemove.xml' -Raw) -Force
+```
+
+> То же самое можно сделать мышкой: **Планировщик заданий → Импортировать задачу…** → выбрать этот XML.
+
+#### Вариант Б — через GUI, без передачи ID устройства
+
+Проще, но `ValueQueries` в интерфейсе не задаются, поэтому скрипт запускается **без** `-DeviceId` и каждый раз делает полную проверку PnP. Работает точно так же, просто чуть чаще срабатывает вхолостую.
 
 1. **Планировщик заданий** → **Создать задачу** (не «простую»).
-2. **Общие:** имя `MonitorSwitchOnKbdRemove`; отметить «Выполнять с наивысшими правами»; «Выполнять только для вошедших пользователей».
-3. **Триггеры** → Создать → «При входе в систему».
+2. **Общие:** имя `MonitorSwitchOnKbdRemove`; «Выполнять с наивысшими правами»; «Выполнять только для вошедших пользователей».
+3. **Триггеры** → Создать → Начать задачу: **«При событии»**, режим «Базовый»:
+   - Журнал: `Microsoft-Windows-Kernel-PnP/Device Management`
+   - Источник: `Kernel-PnP`
+   - Код события: `1010`
+
+   (базовый режим принимает только один код — 1010 достаточно, 1011 встречается редко).
 4. **Действия** → Создать → Программа `powershell.exe`, аргументы:
    ```
-   -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Tools\switch-on-kbd-remove.ps1"
+   -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Tools\switch-on-kbd-remove.ps1"
    ```
 5. **Условия:** снять галку «Запускать только при питании от сети» (для ноутбука).
-6. ОК.
+6. **Параметры:** «Остановить задачу, выполняемую дольше» → 1 час можно уменьшить; при повторном срабатывании — «Не запускать новый экземпляр».
 
 ### 4.7. Проверка (Windows)
 
-Правой кнопкой по задаче → **Выполнить**. Убрать клавиатуру с Windows (переключить свитчем на Mac) → монитор должен уйти на HDMI.
+1. Задача на месте и **не висит** в памяти — состояние должно быть `Ready`, а не `Running`:
+   ```powershell
+   Get-ScheduledTask -TaskName MonitorSwitchOnKbdRemove | Select-Object State
+   ```
+2. Триггер срабатывает — проверяется без трогания свитча: вынуть любую USB-флешку и посмотреть,
+   что задача запускалась (монитор при этом переключиться не должен — клавиатура на месте):
+   ```powershell
+   Get-ScheduledTaskInfo -TaskName MonitorSwitchOnKbdRemove | Select-Object LastRunTime, LastTaskResult
+   ```
+   `LastRunTime` обновился, `LastTaskResult` = 0.
+3. Сквозной тест: нажать кнопку свитча (клавиатура уходит на Mac) → монитор уходит на HDMI за ~2–3 с. Стоит прогнать 2–3 раза туда-обратно.
+
+> Пункт «правой кнопкой → **Выполнить**» для этой задачи не показателен: при ручном запуске подстановка `$(DeviceId)` не выполняется, а клавиатура в этот момент на месте — скрипт корректно завершится, ничего не переключив.
 
 ---
 
@@ -214,8 +310,8 @@ while ($true) {
 ## 6. Нагрузка на систему
 
 - **Mac (Hammerspoon):** полностью событийный, в простое ~0% CPU, ~30–50 МБ RAM.
-- **Windows (скрипт):** один фоновый `powershell.exe` ≈ 30–60 МБ RAM. Раз в 2 сек — короткий опрос PnP-устройств (доли процента CPU, доли миллисекунды). На игры не влияет, выгружать перед игрой не нужно.
-- Хочется совсем чисто — увеличьте интервал опроса до 3–5 сек (`Start-Sleep -Seconds 5`), задержка переключения вырастет на пару секунд, нагрузка станет ещё меньше.
+- **Windows (задача планировщика):** в простое **ничего не запущено** — ни процесса, ни памяти. Задача просыпается только при отключении USB-устройства: в этом сетапе ~30 раз в сутки, каждый раз на доли секунды (события, не связанные с USB, отсекаются за ~100 мс). Для сравнения, прежняя версия с опросом раз в 2 сек делала ~43 000 проверок PnP в сутки и постоянно держала `powershell.exe` в памяти.
+- На игры не влияет, выгружать перед игрой не нужно.
 
 ---
 
@@ -225,6 +321,16 @@ while ($true) {
 - **`lunar set input` не переключает на HDMI** — это ожидаемо для таких панелей, используем сырой `lunar ddc first 0x60 <код>` (уже в конфиге).
 - **На Windows не переключается** — проверьте, что `ControlMyMonitor /SetValue ... 60 17` работает вручную; что `VID_xxxx&PID_xxxx` в скрипте верный; при упрямой панели пробуйте альтернативы **winddcutil** или **Monitorian**.
 - **Скрипт не реагирует на отключение (Windows)** — проверьте `$hwid`: в PowerShell выполните `Get-PnpDevice -PresentOnly | Where-Object InstanceId -like "*VID_0C45*"` при подключённой клавиатуре; строка должна находиться. Если нет — уточните VID/PID клавиатуры и подставьте в `$hwid`.
+- **Задача создана, но ни разу не запускалась** (`LastTaskResult` = 267011, `LastRunTime` = 30.11.1999) — значит подходящего события не было. Убедитесь, что событие вообще пишется: нажмите кнопку свитча и посмотрите свежие записи:
+  ```powershell
+  Get-WinEvent -LogName 'Microsoft-Windows-Kernel-PnP/Device Management' -MaxEvents 20 |
+    Where-Object Id -eq 1010 |
+    Select-Object TimeCreated, @{n='Dev';e={$_.Properties[0].Value}}
+  ```
+  Если записей нет совсем — проверьте, что журнал включён (Просмотр событий → Журналы приложений и служб → Microsoft → Windows → Kernel-PnP → Device Management).
+- **В журнале есть события свитча, но нет событий клавиатуры** — это нормально и так и задумано, см. врезку в п. 4.5. Не пытайтесь сузить триггер до VID/PID клавиатуры.
+- **Переключается не всегда, через раз** — клавиатура не успевает пропасть из PnP к моменту проверки. Увеличьте паузу в скрипте: `Start-Sleep -Milliseconds 1500` → `2500`–`3000`.
+- **Монитор уходит на Mac, когда компьютер засыпает** — ожидаемый побочный эффект: при засыпании USB-устройства отключаются, и сторож видит это как уход клавиатуры. Поведение то же, что и у прежней версии с опросом.
 - **Не тот вход** — уточните коды VCP 0x60 для ваших разъёмов (Lunar: `lunar ddc first 0x60 read`; ControlMyMonitor: значение поля `60`) и поставьте нужные числа.
 - **Монитор вообще не слушает DDC** — включите **DDC/CI** в OSD-меню монитора.
 
